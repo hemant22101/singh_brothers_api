@@ -7,7 +7,9 @@ app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 10000;
 const WIALON_URL = 'https://hst-api.wialon.com/wialon/ajax.html';
-const TOKEN = process.env.WIALON_TOKEN;
+
+// Defaults to your Singh Brothers token if environment variable is not yet set
+const TOKEN = process.env.WIALON_TOKEN || '38d7318f04f9084e413bb027d54e43d5FBB4EE33A40D6819959DC2E9BFCE80A3027A6205';
 const CLIENT_API_KEY = process.env.CLIENT_API_KEY || 'singh_brothers_key_2026';
 
 let sessionId = null;
@@ -55,7 +57,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// 1. Live Vehicles
+// 1. Live Vehicles Tracking Endpoint
 app.get('/api/vehicles', async (req, res) => {
   const providedKey = req.headers['x-api-key'] || req.query.apiKey;
   if (providedKey !== CLIENT_API_KEY) {
@@ -112,26 +114,26 @@ app.get('/api/vehicles', async (req, res) => {
   }
 });
 
-// 2. Report Endpoint configured for Template 5 & Object 29094722
+// 2. Report Endpoint for Singh Brothers (Template 5 & Object 29094722)
 app.get('/api/reports/summary', async (req, res) => {
   const providedKey = req.headers['x-api-key'] || req.query.apiKey;
   if (providedKey !== CLIENT_API_KEY) {
     return res.status(401).json({ status: 'error', message: 'Unauthorized: Invalid API key' });
   }
 
-  // Pre-configured for Singh Brothers Template 5 & Object 29094722
+  // Pre-configured IDs for Singh Brothers
   const resourceId = parseInt(req.query.resourceId) || 29094703;
   const templateId = parseInt(req.query.templateId) || 5;
   const objectId = parseInt(req.query.objectId) || 29094722;
 
-  // Defaults to target interval (09 Sep 2026 window)
+  // Defaults to target interval (1788892200 to 1788978599)
   const from = parseInt(req.query.from) || 1788892200;
   const to = parseInt(req.query.to) || 1788978599;
 
   try {
     let eid = await getSession();
 
-    // Direct synchronous execution (omit remoteExec: 1 to prevent Error 5)
+    // Direct synchronous execution (omit remoteExec: 1 so rows generate immediately)
     const execParams = {
       reportResourceId: resourceId,
       reportTemplateId: templateId,
@@ -170,7 +172,7 @@ app.get('/api/reports/summary', async (req, res) => {
       });
     }
 
-    // Read up to 1000 rows from table index 0
+    // Read up to 1,000 rows from table index 0
     const rowParams = {
       tableIndex: 0,
       config: {
@@ -195,7 +197,7 @@ app.get('/api/reports/summary', async (req, res) => {
       const cols = (row.c || []).map((c) => (typeof c === 'object' ? c.t : c));
       return {
         index: idx + 1,
-        vehicleName: row.t || cols[1] || 'Unknown Unit',
+        vehicleName: row.t || cols[1] || cols[0] || 'Unknown Unit',
         columns: cols
       };
     });
