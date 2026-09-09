@@ -1,7 +1,7 @@
 {
   "name": "singh_brothers_api",
   "version": "1.0.0",
-  "description": "Fleet analytics and reporting API for Singh Brothers",
+  "description": "Fleet analytics API for Singh Brothers",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
