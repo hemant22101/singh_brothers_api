@@ -1,130 +1,127 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
+const cors = require('cors');
 
 const app = express();
+
+app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 10000;
 const WIALON_URL = 'https://hst-api.wialon.com/wialon/ajax.html';
 
+// Account credentials & defaults for Singh Brothers
 const TOKEN = process.env.WIALON_TOKEN || '38d7318f04f9084e413bb027d54e43d5FBB4EE33A40D6819959DC2E9BFCE80A3027A6205';
 const CLIENT_API_KEY = process.env.CLIENT_API_KEY || 'singh_brothers_apikey_1122';
 
-let sessionId = null;
+const DEFAULT_RESOURCE_ID = 29094703;
+const DEFAULT_TEMPLATE_ID = 5;
+const DEFAULT_OBJECT_ID   = 29094722;
 
+let sessionId = null;
+let hardwareMapCache = null;
+let lastCacheTime = 0;
+
+// Session Management
 async function getSession() {
   if (sessionId) return sessionId;
 
+  if (!TOKEN) {
+    throw new Error('Missing WIALON_TOKEN environment variable.');
+  }
+
   const response = await axios.get(WIALON_URL, {
-    params: {
-      svc: 'token/login',
-      params: JSON.stringify({ token: TOKEN })
-    }
+    params: { svc: 'token/login', params: JSON.stringify({ token: TOKEN }) }
   });
 
   if (response.data.error) {
-    throw new Error(`Wialon login failed with code: ${response.data.error}`);
+    throw new Error(`Wialon login failed with error code: ${response.data.error}`);
   }
 
   sessionId = response.data.eid;
   return sessionId;
 }
 
-// Service Health Check
-app.get('/', (req, res) => {
-  res.json({
-    status: 'online',
-    service: 'Singh Brothers Operational Fleet API'
+// Hardware & Unit ID Map: Resolves name to physical IMEI (uid) or permanent Unit ID (id)
+async function getUnitHardwareMap(eid) {
+  const now = Date.now();
+  if (hardwareMapCache && (now - lastCacheTime < 15 * 60 * 1000)) {
+    return hardwareMapCache;
+  }
+
+  const searchParams = {
+    spec: { itemsType: 'avl_unit', propName: 'sys_name', propValueMask: '*', sortType: 'sys_name' },
+    force: 1,
+    flags: 268435457,
+    from: 0,
+    to: 0
+  };
+
+  const res = await axios.get(WIALON_URL, {
+    params: { svc: 'core/search_items', params: JSON.stringify(searchParams), sid: eid }
   });
-});
 
-// 1. Live Vehicles
-app.get('/api/vehicles', async (req, res) => {
-  const providedKey = req.headers['x-api-key'] || req.query.apiKey;
-  if (providedKey !== CLIENT_API_KEY) {
-    return res.status(401).json({ status: 'error', message: 'Unauthorized: Invalid API key' });
-  }
+  const map = {};
+  (res.data.items || []).forEach(unit => {
+    const identifier = unit.uid || (unit.net ? unit.net.uid : null) || unit.id;
 
-  const searchMask = req.query.search ? `*${req.query.search}*` : '*';
-
-  try {
-    let eid = await getSession();
-
-    const searchParams = {
-      spec: { itemsType: 'avl_unit', propName: 'sys_name', propValueMask: searchMask, sortType: 'sys_name' },
-      force: 1,
-      flags: 1025,
-      from: 0,
-      to: 0
-    };
-
-    let result = await axios.get(WIALON_URL, {
-      params: { svc: 'core/search_items', params: JSON.stringify(searchParams), sid: eid }
-    });
-
-    if (result.data.error === 1) {
-      sessionId = null;
-      eid = await getSession();
-      result = await axios.get(WIALON_URL, {
-        params: { svc: 'core/search_items', params: JSON.stringify(searchParams), sid: eid }
-      });
+    if (unit.nm) {
+      const cleanName = unit.nm.trim().toLowerCase();
+      map[cleanName] = identifier;
+      map[cleanName.replace(/[^a-z0-9]/g, '')] = identifier;
     }
+    if (unit.id) {
+      map[String(unit.id)] = identifier;
+    }
+  });
 
-    const vehicles = (result.data.items || []).map((unit) => ({
-      unitId: unit.id,
-      unitName: unit.nm,
-      latitude: unit.pos ? unit.pos.y : null,
-      longitude: unit.pos ? unit.pos.x : null,
-      speedKmh: unit.pos ? unit.pos.s : 0,
-      heading: unit.pos ? unit.pos.c : 0,
-      lastSeen: unit.pos ? new Date(unit.pos.t * 1000).toISOString() : null
-    }));
+  hardwareMapCache = map;
+  lastCacheTime = now;
+  return map;
+}
 
-    res.json({
-      status: 'success',
-      totalCount: vehicles.length,
-      data: vehicles
-    });
-  } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
-  }
-});
-
-// 2. Multi-Section Reports (Theft, Fillings, Idling, Summary)
-app.get('/api/reports/summary', async (req, res) => {
-  const providedKey = req.headers['x-api-key'] || req.query.apiKey;
-  if (providedKey !== CLIENT_API_KEY) {
-    return res.status(401).json({ status: 'error', message: 'Unauthorized: Invalid API key' });
-  }
-
-  const resourceId = parseInt(req.query.resourceId) || 29094703;
-  const templateId = parseInt(req.query.templateId) || 5;
-  const objectId = parseInt(req.query.objectId) || 29094722;
-
-  const targetSection = req.query.section ? String(req.query.section).toLowerCase() : null;
-  const specificTableIndex = req.query.tableIndex !== undefined ? parseInt(req.query.tableIndex) : null;
-
-  // Dynamic calculation for today (00:00:00 IST to current second)
+// Dynamic IST timeframe helper (UTC+5:30)
+function getTodayISTInterval() {
   const now = new Date();
   const istOffsetMs = 5.5 * 60 * 60 * 1000;
   const istNow = new Date(now.getTime() + istOffsetMs);
   const istMidnight = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate(), 0, 0, 0));
+  const from = Math.floor((istMidnight.getTime() - istOffsetMs) / 1000);
+  const to = Math.floor(Date.now() / 1000);
+  return { from, to };
+}
 
-  const defaultFrom = Math.floor((istMidnight.getTime() - istOffsetMs) / 1000);
-  const defaultTo = Math.floor(Date.now() / 1000);
+// Health Check
+app.get('/', (req, res) => {
+  res.json({ status: 'online', service: 'Singh Brothers Operational Fleet API' });
+});
 
-  const from = parseInt(req.query.from) || defaultFrom;
-  const to = parseInt(req.query.to) || defaultTo;
+// Summary Report Endpoint (Excludes location)
+app.get('/api/reports/summary', async (req, res) => {
+  const key = req.headers['x-api-key'] || req.query.apiKey;
+  if (key !== CLIENT_API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized: Invalid API Key' });
+  }
+
+  const resourceId = parseInt(req.query.resourceId) || DEFAULT_RESOURCE_ID;
+  const templateId = parseInt(req.query.templateId) || DEFAULT_TEMPLATE_ID;
+  const objectId   = parseInt(req.query.objectId)   || DEFAULT_OBJECT_ID;
+
+  const defaultInterval = getTodayISTInterval();
+  const from = parseInt(req.query.from) || defaultInterval.from;
+  const to   = parseInt(req.query.to)   || defaultInterval.to;
 
   try {
     let eid = await getSession();
+    const hardwareMap = await getUnitHardwareMap(eid);
 
     const execParams = {
       reportResourceId: resourceId,
       reportTemplateId: templateId,
       reportObjectId: objectId,
       reportObjectSecId: 0,
+      reportObjectIdList: [],
       interval: { from, to, flags: 16777216 }
     };
 
@@ -141,94 +138,67 @@ app.get('/api/reports/summary', async (req, res) => {
     }
 
     if (execRes.data.error) {
-      return res.status(400).json({ error: `Wialon exec_report error: ${execRes.data.error}` });
+      return res.status(400).json({ error: `Wialon report error: ${execRes.data.error}` });
     }
 
     const reportTables = execRes.data.reportResult?.tables || [];
     if (reportTables.length === 0) {
       await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
-      return res.json({ status: 'empty', message: 'No tables generated for this interval.', data: [] });
+      return res.json([]);
     }
 
-    async function fetchTableData(index) {
-      const rowParams = {
-        tableIndex: index,
-        config: { type: 'range', data: { from: 0, to: 1000, level: 0 } }
-      };
-      const rowsRes = await axios.get(WIALON_URL, {
-        params: { svc: 'report/select_result_rows', params: JSON.stringify(rowParams), sid: eid }
-      });
+    const rowParams = {
+      tableIndex: 0,
+      config: { type: 'range', data: { from: 0, to: 1000, level: 0 } }
+    };
 
-      const headers = reportTables[index]?.header || [];
-      const rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
+    const rowsRes = await axios.get(WIALON_URL, {
+      params: { svc: 'report/select_result_rows', params: JSON.stringify(rowParams), sid: eid }
+    });
 
-      const rows = rawRows.map((row, rIdx) => {
-        const cols = (row.c || []).map((c) => (typeof c === 'object' ? c.t : c));
-        const rowData = { index: rIdx + 1, entityName: row.t || cols[0] || 'Unknown' };
-        headers.forEach((h, hIdx) => {
-          if (cols[hIdx] !== undefined) rowData[h || `col_${hIdx}`] = cols[hIdx];
-        });
-        return rowData;
-      });
+    const headers = reportTables[0]?.header || [];
+    const rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
+
+    const getColVal = (cols, keyword) => {
+      const idx = headers.findIndex(h => (h || '').toLowerCase().trim() === keyword.toLowerCase().trim());
+      return idx !== -1 && cols[idx] !== undefined ? cols[idx] : "0.00";
+    };
+
+    const cleanRows = rawRows.map(row => {
+      const cols = (row.c || []).map(c => (typeof c === 'object' ? c.t : c));
+
+      const groupingVal = getColVal(cols, 'Grouping');
+      const machineName = groupingVal !== "0.00" ? groupingVal : (row.t || cols[1] || cols[0] || 'Unknown');
+      const rawName = String(machineName).trim();
+      const normKey = rawName.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+      const uniqueId = hardwareMap[rawName.toLowerCase()] 
+                    || hardwareMap[normKey] 
+                    || (row.i ? hardwareMap[String(row.i)] : null) 
+                    || (row.i ? Number(row.i) : null);
 
       return {
-        tableIndex: index,
-        sectionName: reportTables[index]?.label || reportTables[index]?.name || `Table_${index}`,
-        totalRows: rows.length,
-        headers,
-        rows
+        "Machine GPS Unique ID": uniqueId,
+        "Grouping": rawName,
+        "Run KM": getColVal(cols, 'Run KM'),
+        "Time Run": getColVal(cols, 'Time Run'),
+        "Fuel Opening": getColVal(cols, 'Fuel Opening'),
+        "Fuel Closing": getColVal(cols, 'Fuel Closing'),
+        "Fuel consumed": getColVal(cols, 'Fuel consumed'),
+        "Refulling": getColVal(cols, 'Refulling'),
+        "Fuel Consumption": getColVal(cols, 'Fuel Consumption')
       };
-    }
-
-    let responsePayload;
-
-    if (targetSection === 'all') {
-      const allSections = [];
-      for (let i = 0; i < reportTables.length; i++) {
-        const tableData = await fetchTableData(i);
-        allSections.push(tableData);
-      }
-      responsePayload = { sections: allSections };
-    } else {
-      let targetIdx = 0;
-      if (specificTableIndex !== null && specificTableIndex < reportTables.length) {
-        targetIdx = specificTableIndex;
-      } else if (targetSection) {
-        const found = reportTables.findIndex(
-          (t) =>
-            (t.label && t.label.toLowerCase().includes(targetSection)) ||
-            (t.name && t.name.toLowerCase().includes(targetSection))
-        );
-        if (found !== -1) targetIdx = found;
-      }
-
-      const tableData = await fetchTableData(targetIdx);
-      responsePayload = tableData;
-    }
+    });
 
     await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
 
-    res.json({
-      status: 'success',
-      reportMeta: {
-        resourceId,
-        templateId,
-        objectId,
-        availableSections: reportTables.map((t, idx) => ({ index: idx, name: t.label || t.name }))
-      },
-      period: {
-        fromTimestamp: from,
-        toTimestamp: to,
-        fromDate: new Date(from * 1000).toISOString(),
-        toDate: new Date(to * 1000).toISOString()
-      },
-      ...responsePayload
-    });
+    res.json(cleanRows);
+
   } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server listening on port ${PORT}`);
 });
