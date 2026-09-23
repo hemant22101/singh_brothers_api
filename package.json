@@ -1,14 +1,19 @@
 {
-  "name": "singh_brothers_api",
+  "name": "singh-brothers-fleet-api",
   "version": "1.0.0",
-  "description": "Fleet analytics API for Singh Brothers",
+  "description": "Wialon telematics and fleet report middleware API",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
   "dependencies": {
-    "axios": "^1.7.0",
+    "axios": "^1.7.2",
+    "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
