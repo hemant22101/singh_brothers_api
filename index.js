@@ -11,7 +11,7 @@ app.use(express.json({ limit: '10mb' }));
 const PORT = process.env.PORT || 10000;
 const WIALON_URL = 'https://hst-api.wialon.com/wialon/ajax.html';
 
-// Account credentials & defaults for Singh Brothers
+// Account credentials & default targets for Singh Brothers
 const TOKEN = process.env.WIALON_TOKEN || '38d7318f04f9084e413bb027d54e43d5FBB4EE33A40D6819959DC2E9BFCE80A3027A6205';
 const CLIENT_API_KEY = process.env.CLIENT_API_KEY || 'singh_brothers_apikey_1122';
 
@@ -23,7 +23,7 @@ let sessionId = null;
 let hardwareMapCache = null;
 let lastCacheTime = 0;
 
-// Session Management
+// Session Management with automatic re-login on expiration
 async function getSession() {
   if (sessionId) return sessionId;
 
@@ -43,7 +43,7 @@ async function getSession() {
   return sessionId;
 }
 
-// Hardware & Unit ID Map: Resolves name to physical IMEI (uid) or permanent Unit ID (id)
+// Hardware & Unit ID Mapping (Priority: Hardware IMEI -> Wialon Unit ID)
 async function getUnitHardwareMap(eid) {
   const now = Date.now();
   if (hardwareMapCache && (now - lastCacheTime < 15 * 60 * 1000)) {
@@ -81,7 +81,7 @@ async function getUnitHardwareMap(eid) {
   return map;
 }
 
-// Dynamic IST timeframe helper (UTC+5:30)
+// Helper: dynamic today interval (00:00:00 IST to current timestamp)
 function getTodayISTInterval() {
   const now = new Date();
   const istOffsetMs = 5.5 * 60 * 60 * 1000;
@@ -92,13 +92,13 @@ function getTodayISTInterval() {
   return { from, to };
 }
 
-// Health Check
+// Root Health Check
 app.get('/', (req, res) => {
   res.json({ status: 'online', service: 'Singh Brothers Operational Fleet API' });
 });
 
-// Summary Report Endpoint (Excludes location)
-app.get('/api/reports/summary', async (req, res) => {
+// Primary Report Endpoint supporting Section Selection (summary, fillings, thefts)
+app.get(['/api/reports/summary', '/api/reports'], async (req, res) => {
   const key = req.headers['x-api-key'] || req.query.apiKey;
   if (key !== CLIENT_API_KEY) {
     return res.status(401).json({ error: 'Unauthorized: Invalid API Key' });
@@ -112,10 +112,13 @@ app.get('/api/reports/summary', async (req, res) => {
   const from = parseInt(req.query.from) || defaultInterval.from;
   const to   = parseInt(req.query.to)   || defaultInterval.to;
 
+  const requestedSection = (req.query.section || 'summary').toLowerCase().trim();
+
   try {
     let eid = await getSession();
     const hardwareMap = await getUnitHardwareMap(eid);
 
+    // Execute Wialon Report
     const execParams = {
       reportResourceId: resourceId,
       reportTemplateId: templateId,
@@ -138,7 +141,7 @@ app.get('/api/reports/summary', async (req, res) => {
     }
 
     if (execRes.data.error) {
-      return res.status(400).json({ error: `Wialon report error: ${execRes.data.error}` });
+      return res.status(400).json({ error: `Wialon report error code: ${execRes.data.error}` });
     }
 
     const reportTables = execRes.data.reportResult?.tables || [];
@@ -147,8 +150,28 @@ app.get('/api/reports/summary', async (req, res) => {
       return res.json([]);
     }
 
+    // Determine target table index based on ?section parameter
+    let targetTableIndex = 0; // Default to Table 0 (Summary)
+
+    if (requestedSection.includes('fill') || requestedSection.includes('refuel')) {
+      const idx = reportTables.findIndex(t => /fill|refuel/i.test(t.label || t.name || ''));
+      if (idx !== -1) targetTableIndex = idx;
+    } else if (requestedSection.includes('theft') || requestedSection.includes('drain')) {
+      const idx = reportTables.findIndex(t => /theft|drain/i.test(t.label || t.name || ''));
+      if (idx !== -1) targetTableIndex = idx;
+    } else if (requestedSection.includes('idle') || requestedSection.includes('idling')) {
+      const idx = reportTables.findIndex(t => /idle|idling/i.test(t.label || t.name || ''));
+      if (idx !== -1) targetTableIndex = idx;
+    } else if (req.query.tableIndex !== undefined) {
+      const parsedIdx = parseInt(req.query.tableIndex);
+      if (!isNaN(parsedIdx) && parsedIdx < reportTables.length) {
+        targetTableIndex = parsedIdx;
+      }
+    }
+
+    // Fetch rows for the target table
     const rowParams = {
-      tableIndex: 0,
+      tableIndex: targetTableIndex,
       config: { type: 'range', data: { from: 0, to: 1000, level: 0 } }
     };
 
@@ -156,7 +179,7 @@ app.get('/api/reports/summary', async (req, res) => {
       params: { svc: 'report/select_result_rows', params: JSON.stringify(rowParams), sid: eid }
     });
 
-    const headers = reportTables[0]?.header || [];
+    const headers = reportTables[targetTableIndex]?.header || [];
     const rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
 
     const getColVal = (cols, keyword) => {
@@ -164,32 +187,64 @@ app.get('/api/reports/summary', async (req, res) => {
       return idx !== -1 && cols[idx] !== undefined ? cols[idx] : "0.00";
     };
 
-    const cleanRows = rawRows.map(row => {
-      const cols = (row.c || []).map(c => (typeof c === 'object' ? c.t : c));
+    let cleanRows = [];
 
-      const groupingVal = getColVal(cols, 'Grouping');
-      const machineName = groupingVal !== "0.00" ? groupingVal : (row.t || cols[1] || cols[0] || 'Unknown');
-      const rawName = String(machineName).trim();
-      const normKey = rawName.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (targetTableIndex === 0 && requestedSection === 'summary') {
+      // Clean formatted structure for Summary
+      cleanRows = rawRows.map(row => {
+        const cols = (row.c || []).map(c => (typeof c === 'object' ? c.t : c));
 
-      const uniqueId = hardwareMap[rawName.toLowerCase()] 
-                    || hardwareMap[normKey] 
-                    || (row.i ? hardwareMap[String(row.i)] : null) 
-                    || (row.i ? Number(row.i) : null);
+        const groupingVal = getColVal(cols, 'Grouping');
+        const machineName = groupingVal !== "0.00" ? groupingVal : (row.t || cols[1] || cols[0] || 'Unknown');
+        const rawName = String(machineName).trim();
+        const normKey = rawName.toLowerCase().replace(/[^a-z0-9]/g, '');
 
-      return {
-        "Machine GPS Unique ID": uniqueId,
-        "Grouping": rawName,
-        "Run KM": getColVal(cols, 'Run KM'),
-        "Time Run": getColVal(cols, 'Time Run'),
-        "Fuel Opening": getColVal(cols, 'Fuel Opening'),
-        "Fuel Closing": getColVal(cols, 'Fuel Closing'),
-        "Fuel consumed": getColVal(cols, 'Fuel consumed'),
-        "Refulling": getColVal(cols, 'Refulling'),
-        "Fuel Consumption": getColVal(cols, 'Fuel Consumption')
-      };
-    });
+        const uniqueId = hardwareMap[rawName.toLowerCase()] 
+                      || hardwareMap[normKey] 
+                      || (row.i ? hardwareMap[String(row.i)] : null) 
+                      || (row.i ? Number(row.i) : null);
 
+        return {
+          "Machine GPS Unique ID": uniqueId,
+          "Grouping": rawName,
+          "Run KM": getColVal(cols, 'Run KM'),
+          "Time Run": getColVal(cols, 'Time Run'),
+          "Fuel Opening": getColVal(cols, 'Fuel Opening'),
+          "Fuel Closing": getColVal(cols, 'Fuel Closing'),
+          "Fuel consumed": getColVal(cols, 'Fuel consumed'),
+          "Refulling": getColVal(cols, 'Refulling'),
+          "Fuel Consumption": getColVal(cols, 'Fuel Consumption')
+        };
+      });
+    } else {
+      // Dynamic column mapping for Fillings, Thefts, or custom sub-tables
+      cleanRows = rawRows.map(row => {
+        const cols = (row.c || []).map(c => (typeof c === 'object' ? c.t : c));
+        const rowName = row.t || cols[0] || 'Unknown';
+        const rawName = String(rowName).trim();
+        const normKey = rawName.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+        const uniqueId = hardwareMap[rawName.toLowerCase()] 
+                      || hardwareMap[normKey] 
+                      || (row.i ? hardwareMap[String(row.i)] : null) 
+                      || (row.i ? Number(row.i) : null);
+
+        const rowObj = {
+          "Machine GPS Unique ID": uniqueId,
+          "Vehicle": rawName
+        };
+
+        headers.forEach((headerName, hIdx) => {
+          if (cols[hIdx] !== undefined) {
+            rowObj[headerName || `col_${hIdx}`] = cols[hIdx];
+          }
+        });
+
+        return rowObj;
+      });
+    }
+
+    // Cleanup report session cache on Wialon server
     await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
 
     res.json(cleanRows);
@@ -200,5 +255,5 @@ app.get('/api/reports/summary', async (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
